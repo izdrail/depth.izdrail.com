@@ -1,4 +1,5 @@
 """In-process, single-model wrapper around Marigold V2's inference graph."""
+
 from __future__ import annotations
 
 import asyncio
@@ -18,6 +19,25 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 ASSETS_DIR = Path(os.getenv("DEPTH_ASSETS_DIR", REPO_ROOT / "assets")).resolve()
 DEFAULT_CHECKPOINT: Final = "depth/Log-stage2"
 SUPPORTED_CHECKPOINTS: Final = (DEFAULT_CHECKPOINT,)
+
+
+def missing_inference_assets(assets_dir: Path) -> list[Path]:
+    """Return missing paths from the minimal production inference asset set."""
+    qwen = Path(assets_dir) / "checkpoints" / "Qwen-Image-Edit-2509"
+    marigold = Path(assets_dir) / "checkpoints" / "Marigold-V2"
+    embed_dir = marigold / "qwen_text_embeddings"
+    return [
+        path
+        for path in (
+            qwen / "model_index.json",
+            qwen / "transformer",
+            qwen / "vae",
+            marigold / "depth" / "Log-stage2" / "trainables.safetensors",
+            embed_dir / "qwen_edit_2509_qwen_depth_realimg512_prompt_embeds.pt",
+            embed_dir / "qwen_edit_2509_qwen_depth_realimg512_prompt_mask.pt",
+        )
+        if not path.exists()
+    ]
 
 
 class InferenceConfigurationError(RuntimeError):
@@ -63,16 +83,10 @@ class MarigoldInference:
             if self.loaded:
                 return
             qwen, checkpoint_dir, embed_dir = self._paths(checkpoint)
-            required = (
-                qwen,
-                checkpoint_dir / "trainables.safetensors",
-                embed_dir / "qwen_edit_2509_qwen_depth_realimg512_prompt_embeds.pt",
-                embed_dir / "qwen_edit_2509_qwen_depth_realimg512_prompt_mask.pt",
-            )
-            missing = [str(path) for path in required if not path.exists()]
+            missing = [str(path) for path in missing_inference_assets(self.assets_dir)]
             if missing:
                 raise InferenceConfigurationError(
-                    "Missing model assets; run scripts/download_assets.py --skip-datasets: "
+                    "Missing model assets; run scripts/download_assets.py --inference-only: "
                     + ", ".join(missing)
                 )
 
@@ -86,13 +100,18 @@ class MarigoldInference:
                     "CUDA is required. Run the container with NVIDIA Container Toolkit and --gpus all."
                 )
 
-            from marigoldv2.core.builder import build_transforms, register_experiment_modules
+            from marigoldv2.core.builder import (
+                build_transforms,
+                register_experiment_modules,
+            )
             from marigoldv2.core.registry import REGISTRY
             from marigoldv2.network.change_network_mode import set_to_eval
             from marigoldv2.script.train.util import make_load_trainables_hook
             from marigoldv2.util.config_resolvers import recursive_load_config
 
-            cfg = recursive_load_config(str(REPO_ROOT / "evaluation/config/inference_depth.yaml"))
+            cfg = recursive_load_config(
+                str(REPO_ROOT / "evaluation/config/inference_depth.yaml")
+            )
             cfg.paths = OmegaConf.create(
                 {
                     "ckpt_qwen_image_edit": str(qwen),
@@ -122,7 +141,9 @@ class MarigoldInference:
 
             accelerator = Accelerator(mixed_precision="bf16")
             trainables = checkpoint_dir / "trainables.safetensors"
-            has_vae = any(key.startswith("VAE.") for key in load_file(trainables, device="cpu"))
+            has_vae = any(
+                key.startswith("VAE.") for key in load_file(trainables, device="cpu")
+            )
             loader = make_load_trainables_hook(
                 REGISTRY,
                 accelerator,
@@ -167,7 +188,10 @@ class MarigoldInference:
             tensor = _lanczos_resize_chw(tensor, (resolution, resolution))
             batch = {"rgb_norm": (tensor / 255.0 * 2.0 - 1.0).unsqueeze(0), "out": {}}
             try:
-                with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                with (
+                    torch.inference_mode(),
+                    torch.amp.autocast("cuda", dtype=torch.bfloat16),
+                ):
                     self._model(batch)
                 raw = batch["out"]["depth_pred"][0, 0].float().cpu().numpy()
             except torch.OutOfMemoryError as exc:

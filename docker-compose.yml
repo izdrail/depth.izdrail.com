@@ -3,6 +3,8 @@ services:
     image: izdrail/marigold.izdrail.com:latest
     build: .
     ports: ["8000:8000"]
+    volumes:
+      - marigold-models:/opt/marigold-assets
     deploy:
       resources:
         reservations:
@@ -10,3 +12,6 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+
+volumes:
+  marigold-models:

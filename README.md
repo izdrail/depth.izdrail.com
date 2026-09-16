@@ -423,24 +423,33 @@ The 6-8 GB target at 256 and 8-10 GB target at 512 are planning targets, not mea
 
 ## Docker
 
-Build downloads the inference-only assets through the existing downloader. Expect a very large download and image. The inference-only asset set is roughly 42 GB before image-layer overhead: about 40 GB of Qwen transformer weights, 254 MB of VAE weights, the 1.85 GB Log-stage2 trainables, and prompt embeddings. These are repository manifests, not a measured final Docker image size:
+The image contains the application and CUDA/Python dependencies, but not the roughly 42 GB inference asset set. At container boot, the entrypoint validates `DEPTH_ASSETS_DIR`, downloads the inference-only assets when they are missing, validates them again, and then starts Uvicorn. The Hugging Face downloader is resumable.
+
+Persist `/opt/marigold-assets` so restarts and image upgrades do not download the models again:
 
 ```bash
 docker build -t izdrail/marigold.izdrail.com:latest .
-docker run --gpus all --rm -p 8000:8000 izdrail/marigold.izdrail.com:latest
-# or
+docker volume create marigold-models
+docker run --gpus all --rm -p 8000:8000 \
+  -v marigold-models:/opt/marigold-assets \
+  izdrail/marigold.izdrail.com:latest
+# docker compose uses the same named volume automatically
 docker compose up --build
 ```
 
-`DEPTH_ASSETS_DIR=/opt/marigold-assets` points the runtime at baked assets. The Dockerfile copies dependency metadata and runs `scripts/download_assets.py --inference-only` before copying API source, so normal application edits reuse the model layer when the BuildKit cache is available. BuildKit's local/registry cache is better suited to the asset layer than GitHub Actions cache, whose quota and eviction make multi-gigabyte model caches unreliable.
+`DEPTH_ASSETS_DIR` is configurable. Mount the persistent volume at the same path. The initial boot needs enough free disk for the model set and can take a long time; service readiness stays unavailable until preparation and validation finish.
 
 Open:
 
 - Vue application: http://localhost:8000/
 - OpenAPI UI: http://localhost:8000/docs
-- health: http://localhost:8000/api/health
+- readiness: http://localhost:8000/api/health
 
-The healthcheck is deliberately cheap. It proves the HTTP process is live without loading the model. Model/assets/CUDA readiness is established by startup logs and the first inference; failures return a clear 503 rather than reporting a successful prediction.
+The container starts Uvicorn only after model validation. The readiness endpoint also checks the required asset paths and returns HTTP 503 with `status=starting` if they are missing. It does not allocate GPU memory or load the inference graph; the first prediction does that.
+
+### Coolify
+
+Deploy the published image with NVIDIA GPU access and add persistent storage mounted at `/opt/marigold-assets` (for example, a named volume called `marigold-models`). Keep `DEPTH_ASSETS_DIR=/opt/marigold-assets`. Allow the first deployment enough startup time and at least roughly 50 GB of persistent free space for the current 42 GB asset set plus download overhead. Do not use ephemeral container storage for this directory.
 
 ## API
 
@@ -463,11 +472,13 @@ curl -sS http://localhost:8000/api/predict \
 
 The response contains `depth_png_base64`, the same normalized Spectral display PNG as the CLI visualizer, resized to the original input dimensions; `prediction_npy_base64`, the raw float32 NumPy array at the requested inference resolution; and metadata with checkpoint, resolution, original and raw dimensions, and measured inference duration. The VAE encoder is stochastic and seeded like the CLI. Identical seeds are intended to reproduce its behavior, but exact bitwise determinism can still depend on CUDA kernels and hardware.
 
-`GET /api/health` returns:
+`GET /api/health` returns HTTP 200 after boot-time asset validation:
 
 ```json
-{"status":"ok"}
+{"status":"ok","model_assets_ready":true}
 ```
+
+If assets disappear after startup it returns HTTP 503 with `{"status":"starting","model_assets_ready":false}`.
 
 ## Local development
 
@@ -498,7 +509,7 @@ Vite proxies `/api` to `http://localhost:8000`. The frontend has drag-and-drop/f
 - `DOCKERHUB_USERNAME`
 - `DOCKERHUB_TOKEN`
 
-GitHub-hosted runners have no NVIDIA GPU. This workflow validates the image build only; it does not claim to test CUDA inference. Because the build downloads very large assets, a dedicated registry cache or self-hosted builder is recommended if standard Actions cache proves too small.
+GitHub-hosted runners have no NVIDIA GPU. This workflow validates the slim application image build only; it does not download model assets or claim to test CUDA inference. Model preparation happens on the deployment host at container boot.
 
 ## GPU acceptance check
 

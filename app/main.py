@@ -1,4 +1,5 @@
 """FastAPI HTTP and static frontend entry point."""
+
 from __future__ import annotations
 
 import base64
@@ -7,7 +8,7 @@ import os
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, UnidentifiedImageError
@@ -20,6 +21,7 @@ from app.inference import (
     InferenceOutOfMemoryError,
     MarigoldInference,
     encode_npy,
+    missing_inference_assets,
 )
 
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(15 * 1024 * 1024)))
@@ -28,7 +30,8 @@ FRONTEND_DIR = Path(os.getenv("FRONTEND_DIR", Path(__file__).parent / "static"))
 
 
 class HealthResponse(BaseModel):
-    status: str = "ok"
+    status: str
+    model_assets_ready: bool
 
 
 class PredictionMetadata(BaseModel):
@@ -42,8 +45,12 @@ class PredictionMetadata(BaseModel):
 
 
 class PredictionResponse(BaseModel):
-    depth_png_base64: str = Field(description="Display PNG resized to the input dimensions")
-    prediction_npy_base64: str = Field(description="Raw float32 NumPy array at inference resolution")
+    depth_png_base64: str = Field(
+        description="Display PNG resized to the input dimensions"
+    )
+    prediction_npy_base64: str = Field(
+        description="Raw float32 NumPy array at inference resolution"
+    )
     metadata: PredictionMetadata
 
 
@@ -56,21 +63,34 @@ app.state.inference = MarigoldInference()
 
 
 @app.get("/api/health", response_model=HealthResponse, tags=["system"])
-async def health() -> HealthResponse:
-    """Cheap liveness check. It does not load the model or run inference."""
-    return HealthResponse()
+async def health(response: Response) -> HealthResponse:
+    """Readiness check: healthy only after required model assets exist."""
+    ready = not missing_inference_assets(app.state.inference.assets_dir)
+    if not ready:
+        response.status_code = 503
+    return HealthResponse(
+        status="ok" if ready else "starting", model_assets_ready=ready
+    )
 
 
 @app.post(
     "/api/predict",
     response_model=PredictionResponse,
     tags=["inference"],
-    responses={400: {"description": "Invalid image or parameters"}, 413: {"description": "Upload too large"}, 503: {"description": "GPU or model unavailable"}},
+    responses={
+        400: {"description": "Invalid image or parameters"},
+        413: {"description": "Upload too large"},
+        503: {"description": "GPU or model unavailable"},
+    },
 )
 async def predict(
     image: Annotated[UploadFile, File(description="JPEG or PNG input image")],
-    resolution: Annotated[int, Form(description="Square inference resolution: 256 or 512")] = 256,
-    checkpoint: Annotated[str, Form(description="Allow-listed Marigold checkpoint")] = DEFAULT_CHECKPOINT,
+    resolution: Annotated[
+        int, Form(description="Square inference resolution: 256 or 512")
+    ] = 256,
+    checkpoint: Annotated[
+        str, Form(description="Allow-listed Marigold checkpoint")
+    ] = DEFAULT_CHECKPOINT,
     seed: Annotated[
         int,
         Form(
@@ -83,13 +103,17 @@ async def predict(
     if resolution not in (256, 512):
         raise HTTPException(422, "resolution must be 256 or 512")
     if checkpoint not in SUPPORTED_CHECKPOINTS:
-        raise HTTPException(422, f"checkpoint must be one of: {', '.join(SUPPORTED_CHECKPOINTS)}")
+        raise HTTPException(
+            422, f"checkpoint must be one of: {', '.join(SUPPORTED_CHECKPOINTS)}"
+        )
     if image.content_type not in {"image/jpeg", "image/png"}:
         raise HTTPException(415, "Only JPEG and PNG uploads are supported")
     data = await image.read(MAX_UPLOAD_BYTES + 1)
     await image.close()
     if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(413, f"Image exceeds the {MAX_UPLOAD_BYTES}-byte upload limit")
+        raise HTTPException(
+            413, f"Image exceeds the {MAX_UPLOAD_BYTES}-byte upload limit"
+        )
     try:
         with Image.open(io.BytesIO(data)) as opened:
             opened.verify()
